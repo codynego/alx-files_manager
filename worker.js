@@ -1,72 +1,73 @@
-/**
- * A worker that processes the fileQueue
- * It fecthes the file from the mongodb database
- * Creates 3 thumbnails of width size 500, 250 and 100
- */
-import fs from 'fs';
 import Queue from 'bull';
 import { ObjectId } from 'mongodb';
-import imageThumbnail from 'image-thumbnail';
-import dbClient from './utils/db';
+import { promises as fsPromises } from 'fs';
+import fileUtils from './utils/file';
+import userUtils from './utils/user';
+import basicUtils from './utils/basic';
+
+const imageThumbnail = require('image-thumbnail');
 
 const fileQueue = new Queue('fileQueue');
 const userQueue = new Queue('userQueue');
 
-async function thumbnail(path, width) {
-  try {
-    const newPath = `${path}_${width}`;
-    const thumbnail = await imageThumbnail(path, { width });
-    fs.writeFileSync(newPath, thumbnail);
-    return Promise.resolve(width);
-  } catch (error) {
-    console.log(error);
-    return Promise.reject(width);
-  }
-}
+fileQueue.process(async (job) => {
+  const { fileId, userId } = job.data;
 
-async function unlink(path, widths) {
-  for (const width of widths) {
-    fs.unlink(`${path}_${width.value}`, (err) => {
-      if (err) console.log(`Error encountered while removing: ${path}_${width.value}`);
-    });
-  }
-}
+  // Delete bull keys in redis
+  //   redis-cli keys "bull*" | xargs redis-cli del
 
-fileQueue.process((job, done) => {
-  const { userId, fileId } = job.data;
-  if (userId === undefined) done(new Error('Missing userId'));
-  if (fileId === undefined) done(new Error('Missing fileId'));
-  dbClient.findOne('files', { _id: ObjectId(fileId), userId: ObjectId(userId) })
-    .then((file) => {
-      if (!file) throw new Error('File not found');
-      const path = file.localPath;
-      Promise.allSettled([thumbnail(path, 500), thumbnail(path, 250), thumbnail(path, 100)])
-        .then((results) => {
-          const fails = results.filter((r) => r.status === 'rejected');
-          if (fails.length > 0) {
-            const success = results.filter((r) => r.status === 'fulfilled');
-            unlink(path, success);
-            done(new Error('Could not create thumbnails successfully!'));
-          }
-          console.log('All thumbnails created!');
-          done();
-        });
-    })
-    .catch((err) => {
-      console.log(err);
-      done(err);
-    });
+  if (!userId) {
+    console.log('Missing userId');
+    throw new Error('Missing userId');
+  }
+
+  if (!fileId) {
+    console.log('Missing fileId');
+    throw new Error('Missing fileId');
+  }
+
+  if (!basicUtils.isValidId(fileId) || !basicUtils.isValidId(userId)) throw new Error('File not found');
+
+  const file = await fileUtils.getFile({
+    _id: ObjectId(fileId),
+    userId: ObjectId(userId),
+  });
+
+  if (!file) throw new Error('File not found');
+
+  const { localPath } = file;
+  const options = {};
+  const widths = [500, 250, 100];
+
+  widths.forEach(async (width) => {
+    options.width = width;
+    try {
+      const thumbnail = await imageThumbnail(localPath, options);
+      await fsPromises.writeFile(`${localPath}_${width}`, thumbnail);
+      //   console.log(thumbnail);
+    } catch (err) {
+      console.error(err.message);
+    }
+  });
 });
 
-userQueue.process(async (job, done) => {
+userQueue.process(async (job) => {
   const { userId } = job.data;
-  try {
-    if (userId === undefined) throw new Error('Missing UserId');
-    const user = await dbClient.findOne('users', { _id: ObjectId(userId) });
-    if (!user) throw new Error('User not found');
-    console.log(`Welome ${user.email}`);
-    done();
-  } catch (error) {
-    done(error);
+  // Delete bull keys in redis
+  //   redis-cli keys "bull*" | xargs redis-cli del
+
+  if (!userId) {
+    console.log('Missing userId');
+    throw new Error('Missing userId');
   }
+
+  if (!basicUtils.isValidId(userId)) throw new Error('User not found');
+
+  const user = await userUtils.getUser({
+    _id: ObjectId(userId),
+  });
+
+  if (!user) throw new Error('User not found');
+
+  console.log(`Welcome ${user.email}!`);
 });
